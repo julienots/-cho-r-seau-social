@@ -67,7 +67,15 @@ class ClaudeAgent(
     val isRunning get() = job?.isActive == true
 
     fun reset() {
+        val j = job
         stop()
+        clearAll()
+        // L'arrêt est asynchrone : on revide une fois la tâche vraiment terminée
+        // (elle complète les outils interrompus en se fermant).
+        j?.invokeOnCompletion { scope.launch(Dispatchers.Main) { if (job === j) clearAll() } }
+    }
+
+    private fun clearAll() {
         history.clear(); pendingResults.clear(); pendingText.clear(); queued.clear(); openToolUses.clear()
     }
 
