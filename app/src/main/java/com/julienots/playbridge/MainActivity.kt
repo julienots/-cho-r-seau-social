@@ -4,12 +4,15 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.DownloadManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.text.InputType
@@ -23,7 +26,6 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
@@ -32,7 +34,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -40,7 +41,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.ViewCompat
@@ -52,21 +52,24 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.security.SecureRandom
 
-class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
+class MainActivity : Activity(), BrowserTools.Ui, McpServer.Listener {
+
+    enum class LogKind { CLIENT, CLAUDE, ACTION, INFO, ERROR }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var web: WebView
     private lateinit var controller: WebController
-    private lateinit var agent: ClaudeAgent
+    private lateinit var server: McpServer
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
-    private lateinit var chatPanel: LinearLayout
-    private lateinit var input: EditText
-    private lateinit var sendBtn: Button
+    private lateinit var body: LinearLayout
+    private lateinit var addressView: TextView
+    private lateinit var headerText: TextView
     private lateinit var urlView: TextView
     private lateinit var progressBar: ProgressBar
-    private lateinit var toggleBtn: TextView
     private val logText = SpannableStringBuilder()
     private var fileCallback: ValueCallback<Array<Uri>>? = null
 
@@ -76,6 +79,10 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
 
     private val accent = Color.parseColor("#D97757")
     private val dark = Color.parseColor("#1F1E1D")
+
+    private val isTablet get() = resources.configuration.smallestScreenWidthDp >= 600
+    private val deviceLabel get() = prefs.getString("device_name", null)?.takeIf { it.isNotBlank() } ?: if (isTablet) "tablette" else "telephone"
+    private val serverKey get() = "playconsole-" + deviceLabel.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -90,7 +97,6 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(4), dp(2), dp(4), dp(2))
-            setBackgroundColor(dark)
         }
         fun barButton(label: String, onClick: () -> Unit) = TextView(this).apply {
             text = label
@@ -129,68 +135,60 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
         frame.addView(indicator, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(frame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        // ----- panneau Claude
-        toggleBtn = TextView(this).apply {
-            text = "▼ Claude"
-            setTextColor(Color.WHITE)
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            setBackgroundColor(accent)
-            setOnClickListener { toggleChat() }
-        }
+        // ----- panneau MCP
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(accent)
             gravity = Gravity.CENTER_VERTICAL
         }
-        header.addView(toggleBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        header.addView(TextView(this).apply {
-            text = "⟲ Nouvelle conversation"
+        headerText = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            setOnClickListener { confirmReset() }
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            setOnClickListener { togglePanel() }
+        }
+        header.addView(headerText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(TextView(this).apply {
+            text = "Connecter Claude"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            setOnClickListener { showConnectHelp() }
         })
         root.addView(header)
 
-        chatPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#2A2927")) }
+        body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#2A2927")) }
+        val addrRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(6), dp(8), dp(2))
+        }
+        addressView = TextView(this).apply {
+            setTextColor(Color.parseColor("#EDEBE6"))
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextIsSelectable(true)
+        }
+        addrRow.addView(addressView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addrRow.addView(Button(this).apply {
+            text = "Copier"
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(accent) }
+            setOnClickListener { copy("Adresse MCP", mcpUrl() ?: "") }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)).apply { leftMargin = dp(8) })
+        body.addView(addrRow)
+
         logView = TextView(this).apply {
             setTextColor(Color.parseColor("#EDEBE6"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(12), dp(4), dp(12), dp(8))
             setTextIsSelectable(true)
         }
         logScroll = ScrollView(this).apply { addView(logView) }
-        chatPanel.addView(logScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (resources.displayMetrics.heightPixels * 0.24f).toInt()))
-
-        val inputRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(6), dp(8), dp(8))
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        input = EditText(this).apply {
-            hint = "Dis à Claude quoi faire dans la Play Console…"
-            setHintTextColor(Color.parseColor("#8A8780"))
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-            maxLines = 4
-            imeOptions = EditorInfo.IME_ACTION_SEND
-            background = GradientDrawable().apply { cornerRadius = dp(18).toFloat(); setColor(Color.parseColor("#3A3936")) }
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            setOnEditorActionListener { _, id, _ -> if (id == EditorInfo.IME_ACTION_SEND) { onSend(); true } else false }
-        }
-        inputRow.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        sendBtn = Button(this).apply {
-            text = "Envoyer"
-            setTextColor(Color.WHITE)
-            isAllCaps = false
-            background = GradientDrawable().apply { cornerRadius = dp(18).toFloat(); setColor(accent) }
-            setOnClickListener { onSendOrStop() }
-        }
-        inputRow.addView(sendBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { leftMargin = dp(8) })
-        chatPanel.addView(inputRow)
-        root.addView(chatPanel)
+        body.addView(logScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (resources.displayMetrics.heightPixels * (if (isTablet) 0.16f else 0.2f)).toInt()))
+        root.addView(body)
 
         setContentView(root)
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
@@ -202,12 +200,151 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
 
         setupWebView()
         controller = WebController(web, window, indicator)
-        agent = ClaudeAgent(BrowserTools(controller, this), this, scope)
+        server = McpServer(BrowserTools(controller, this), "${deviceLabel} · ${Build.MODEL}", this)
+        server.token = token()
 
-        log(ClaudeAgent.LogKind.INFO, "Bienvenue ! Connecte-toi à ta Play Console ci-dessus, puis dis à Claude ce qu'il doit faire (ex. « Crée une nouvelle application nommée Kittyro »). Il navigue tant que l'appli reste ouverte.")
         if (savedInstanceState != null) web.restoreState(savedInstanceState) else web.loadUrl(homeUrl)
-        if (apiKey().isBlank()) showSettings()
+        startServer()
+        log(LogKind.INFO, "Connecte-toi à ta Play Console ci-dessus, puis touche « Connecter Claude » pour relier Claude à cet appareil (même Wi-Fi). Garde l'appli ouverte pendant qu'il travaille.")
     }
+
+    // ----------------------------------------------------------------- serveur MCP
+
+    private fun token(): String {
+        var t = prefs.getString("token", null)
+        if (t.isNullOrBlank()) { t = newToken(); prefs.edit().putString("token", t).apply() }
+        return t
+    }
+
+    private fun newToken(): String {
+        val chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val r = SecureRandom()
+        return (1..24).map { chars[r.nextInt(chars.length)] }.joinToString("")
+    }
+
+    private fun startServer() {
+        try {
+            server.start(prefs.getInt("port", 8765))
+            if (prefs.getBoolean("keep_screen", true)) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } catch (e: Exception) {
+            log(LogKind.ERROR, "Impossible de démarrer le serveur MCP : ${e.message}")
+        }
+        refreshAddress()
+    }
+
+    private fun mcpUrl(): String? {
+        if (!server.isRunning) return null
+        val ip = McpServer.localAddresses().firstOrNull() ?: return null
+        return "http://$ip:${server.port}/mcp/${server.token}"
+    }
+
+    private fun refreshAddress() {
+        val url = mcpUrl()
+        addressView.text = when {
+            !server.isRunning -> "Serveur MCP arrêté"
+            url == null -> "Pas de réseau Wi-Fi : connecte l'appareil au même Wi-Fi que ton ordinateur.\nSur l'appareil lui-même : http://127.0.0.1:${server.port}/mcp/${server.token}"
+            else -> url
+        }
+        updateHeader()
+    }
+
+    private fun updateHeader() {
+        val open = body.visibility == View.VISIBLE
+        headerText.text = (if (open) "▼ " else "▲ ") + (if (server.isRunning) "● MCP actif — $deviceLabel" else "○ MCP arrêté")
+    }
+
+    private fun togglePanel() {
+        body.visibility = if (body.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        updateHeader()
+    }
+
+    override fun onClientConnected(clientName: String) {
+        runOnUiThread { log(LogKind.CLIENT, "$clientName s'est connecté.") }
+    }
+
+    override fun onToolCall(name: String, args: JSONObject) {
+        runOnUiThread { log(LogKind.ACTION, describe(name, args)) }
+    }
+
+    override fun onToolResult(name: String, output: ToolOutput) {
+        if (output.isError) runOnUiThread { log(LogKind.ERROR, output.text.take(300)) }
+    }
+
+    private fun describe(name: String, a: JSONObject): String {
+        fun g(k: String) = if (a.has(k) && !a.isNull(k)) a.opt(k)?.toString() else null
+        return when (name) {
+            "screenshot" -> "📷 Capture d'écran"
+            "read_page" -> "📖 Lecture de la page"
+            "click" -> "👆 Toucher " + (g("text")?.let { "« $it »" } ?: g("index")?.let { "élément #$it" } ?: g("selector") ?: "(${g("x")}, ${g("y")})")
+            "type_text" -> "⌨️ Écrire « ${g("text")?.take(60)} »"
+            "select_option" -> "☑️ Choisir « ${g("option")} »"
+            "press_key" -> "⌨️ Touche ${g("key")}"
+            "scroll" -> "↕️ Défiler ${g("direction")}"
+            "navigate" -> "🌐 " + (g("url") ?: g("action") ?: "")
+            "wait" -> "⏳ Attendre " + (g("until_text")?.let { "« $it »" } ?: g("until_gone")?.let { "disparition de « $it »" } ?: "${g("seconds") ?: 3} s")
+            "run_js" -> "🧩 Script dans la page"
+            "message" -> "💬 Message"
+            "status" -> "ℹ️ État"
+            else -> name
+        }
+    }
+
+    private fun showConnectHelp() {
+        val url = mcpUrl()
+        if (url == null) {
+            AlertDialog.Builder(this).setTitle("Pas de Wi-Fi")
+                .setMessage("Connecte cet appareil au même réseau Wi-Fi que l'ordinateur où tourne Claude, puis réessaie.")
+                .setPositiveButton("OK", null).show()
+            refreshAddress()
+            return
+        }
+        val name = serverKey
+        val codeCmd = "claude mcp add --transport http $name $url"
+        val desktopJson = """
+{
+  "mcpServers": {
+    "$name": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "$url", "--allow-http"]
+    }
+  }
+}""".trim()
+        val msg = """
+Claude se connecte à cet appareil par le Wi-Fi (MCP local, sans clé API). L'ordinateur et cet appareil doivent être sur le même Wi-Fi.
+
+• Claude Code (terminal) :
+$codeCmd
+
+• Claude Desktop : Réglages → Développeur → Modifier la config, ajoute dans claude_desktop_config.json :
+$desktopJson
+puis redémarre Claude Desktop (Node.js doit être installé).
+
+• Téléphone ET tablette : installe l'appli sur les deux. Chacun affiche sa propre adresse : ajoute les deux dans Claude avec deux noms différents (ex. playconsole-telephone et playconsole-tablette). Tu choisis ensuite sur lequel Claude travaille en le lui disant.
+
+L'adresse contient un jeton secret : ne la partage pas. Si l'adresse IP de l'appareil change (autre Wi-Fi, redémarrage de la box), mets-la à jour dans Claude.
+        """.trimIndent()
+        val tv = TextView(this).apply {
+            text = msg
+            setTextIsSelectable(true)
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Connecter Claude à cet appareil")
+            .setView(ScrollView(this).apply { addView(tv) })
+            .setPositiveButton("Copier commande Claude Code") { _, _ -> copy("Commande Claude Code", codeCmd) }
+            .setNeutralButton("Copier config Desktop") { _, _ -> copy("Config Claude Desktop", desktopJson) }
+            .setNegativeButton("Fermer", null)
+            .show()
+    }
+
+    private fun copy(label: String, text: String) {
+        if (text.isEmpty()) return
+        (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(label, text))
+        Toast.makeText(this, "$label copiée", Toast.LENGTH_SHORT).show()
+    }
+
+    // ----------------------------------------------------------------- WebView
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
@@ -235,7 +372,6 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
                 val u = request.url
                 val scheme = u.scheme ?: return false
                 if (scheme == "http" || scheme == "https") return false
-                // intent:, mailto:, market: … → autres applis
                 runCatching { startActivity(Intent(Intent.ACTION_VIEW, u)) }
                 return true
             }
@@ -259,7 +395,7 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
                 fileCallback?.onReceiveValue(null)
                 fileCallback = callback
                 controller.fileChooserOpened = true
-                log(ClaudeAgent.LogKind.INFO, "📁 Choisis le fichier demandé dans le sélecteur qui vient de s'ouvrir.")
+                log(LogKind.INFO, "📁 Choisis le fichier demandé dans le sélecteur qui vient de s'ouvrir.")
                 return try {
                     val intent = params.createIntent().apply {
                         if (params.mode == FileChooserParams.MODE_OPEN_MULTIPLE) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
@@ -290,13 +426,9 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
     }
 
     private fun applyUserAgent() {
-        val s = web.settings
         val desktop = prefs.getBoolean("desktop", true)
-        s.userAgentString = if (desktop) {
-            DESKTOP_UA
-        } else {
-            WebSettings.getDefaultUserAgent(this).replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
-        }
+        web.settings.userAgentString = if (desktop) DESKTOP_UA
+        else WebSettings.getDefaultUserAgent(this).replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
     }
 
     @Deprecated("Activity API")
@@ -312,128 +444,81 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
         }
         cb.onReceiveValue(result)
         controller.fileChooserOpened = false
-        if (result != null) log(ClaudeAgent.LogKind.INFO, "Fichier choisi.") else log(ClaudeAgent.LogKind.INFO, "Aucun fichier choisi.")
+        log(LogKind.INFO, if (result != null) "Fichier choisi." else "Aucun fichier choisi.")
     }
 
-    // ----------------------------------------------------------------- discussion
+    // ----------------------------------------------------------------- journal
 
-    private fun onSendOrStop() {
-        if (agent.isRunning && input.text.isBlank()) {
-            agent.stop()
-        } else onSend()
-    }
-
-    private fun onSend() {
-        val text = input.text.toString().trim()
-        if (text.isEmpty()) return
-        val key = apiKey()
-        if (key.isBlank()) { showSettings(); return }
-        input.setText("")
-        if (chatPanel.getChildAt(0).visibility != View.VISIBLE) toggleChat()
-        agent.send(text, ClaudeAgent.Config(key, prefs.getString("model", MODELS[0].first)!!, prefs.getString("effort", "medium")!!))
-    }
-
-    override fun onLog(kind: ClaudeAgent.LogKind, text: String) = log(kind, text)
-
-    private fun log(kind: ClaudeAgent.LogKind, text: String) {
+    private fun log(kind: LogKind, text: String) {
         val (prefix, color) = when (kind) {
-            ClaudeAgent.LogKind.USER -> "Toi : " to Color.parseColor("#9CC7FF")
-            ClaudeAgent.LogKind.CLAUDE -> "Claude : " to accent
-            ClaudeAgent.LogKind.ACTION -> "   " to Color.parseColor("#8A8780")
-            ClaudeAgent.LogKind.INFO -> "ℹ " to Color.parseColor("#B5B2AA")
-            ClaudeAgent.LogKind.ERROR -> "⚠ " to Color.parseColor("#FF8A80")
+            LogKind.CLIENT -> "🔗 " to Color.parseColor("#9CC7FF")
+            LogKind.CLAUDE -> "Claude : " to accent
+            LogKind.ACTION -> "   " to Color.parseColor("#B5B2AA")
+            LogKind.INFO -> "ℹ " to Color.parseColor("#B5B2AA")
+            LogKind.ERROR -> "⚠ " to Color.parseColor("#FF8A80")
         }
         if (logText.isNotEmpty()) logText.append("\n")
         val start = logText.length
         logText.append(prefix)
         logText.setSpan(ForegroundColorSpan(color), start, logText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        if (kind == ClaudeAgent.LogKind.CLAUDE || kind == ClaudeAgent.LogKind.USER) {
-            logText.setSpan(StyleSpan(Typeface.BOLD), start, logText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        }
         val bodyStart = logText.length
         logText.append(text)
-        if (kind == ClaudeAgent.LogKind.ACTION || kind == ClaudeAgent.LogKind.ERROR || kind == ClaudeAgent.LogKind.INFO) {
+        if (kind == LogKind.CLAUDE) {
+            logText.setSpan(StyleSpan(Typeface.BOLD), start, logText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        } else if (kind != LogKind.CLIENT) {
             logText.setSpan(ForegroundColorSpan(color), bodyStart, logText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
-        // On garde la discussion légère.
-        if (logText.length > 40_000) logText.delete(0, logText.length - 30_000)
+        if (logText.length > 30_000) logText.delete(0, logText.length - 20_000)
         logView.text = logText
         logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
-    override fun onRunningChanged(running: Boolean) {
-        sendBtn.text = if (running) "Stop" else "Envoyer"
-        toggleBtn.text = (if (chatPanel.getChildAt(0).visibility == View.VISIBLE) "▼" else "▲") + if (running) " Claude travaille…" else " Claude"
-        // Écran allumé pendant que Claude travaille : la page ne doit pas se mettre en veille.
-        if (running) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    }
-
-    private fun toggleChat() {
-        val v = chatPanel.getChildAt(0)
-        v.visibility = if (v.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        onRunningChanged(agent.isRunning)
-    }
-
-    private fun confirmReset() {
-        AlertDialog.Builder(this)
-            .setMessage("Effacer la conversation avec Claude ? (La page reste ouverte.)")
-            .setPositiveButton("Effacer") { _, _ ->
-                agent.reset(); logText.clear(); logView.text = ""
-                log(ClaudeAgent.LogKind.INFO, "Nouvelle conversation.")
-            }
-            .setNegativeButton("Annuler", null)
-            .show()
-    }
-
     // ----------------------------------------------------------------- réglages
-
-    private fun apiKey() = prefs.getString("api_key", "") ?: ""
 
     private fun showSettings() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(0)) }
-        box.addView(TextView(this).apply {
-            text = "Clé API Anthropic (console.anthropic.com → API Keys). Elle reste sur ce téléphone."
-            setPadding(0, dp(4), 0, dp(4))
-        })
-        val keyEdit = EditText(this).apply {
-            setText(apiKey())
-            hint = "sk-ant-…"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        box.addView(TextView(this).apply { text = "Nom de cet appareil (affiché à Claude)" })
+        val nameEdit = EditText(this).apply { setText(deviceLabel); isSingleLine = true }
+        box.addView(nameEdit)
+        box.addView(TextView(this).apply { text = "Port du serveur MCP"; setPadding(0, dp(10), 0, 0) })
+        val portEdit = EditText(this).apply {
+            setText(prefs.getInt("port", 8765).toString())
+            inputType = InputType.TYPE_CLASS_NUMBER
             isSingleLine = true
         }
-        box.addView(keyEdit)
-        box.addView(TextView(this).apply { text = "Modèle"; setPadding(0, dp(12), 0, 0) })
-        val modelSpin = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, MODELS.map { it.second })
-            setSelection(MODELS.indexOfFirst { it.first == prefs.getString("model", MODELS[0].first) }.coerceAtLeast(0))
-        }
-        box.addView(modelSpin)
-        box.addView(TextView(this).apply { text = "Effort de réflexion"; setPadding(0, dp(12), 0, 0) })
-        val efforts = listOf("low" to "Rapide (low)", "medium" to "Normal (medium)", "high" to "Approfondi (high)")
-        val effortSpin = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, efforts.map { it.second })
-            setSelection(efforts.indexOfFirst { it.first == prefs.getString("effort", "medium") }.coerceAtLeast(0))
-        }
-        box.addView(effortSpin)
+        box.addView(portEdit)
         val desktopCheck = CheckBox(this).apply {
             text = "Version ordinateur du site (recommandé pour la Play Console)"
             isChecked = prefs.getBoolean("desktop", true)
         }
         box.addView(desktopCheck)
+        val screenCheck = CheckBox(this).apply {
+            text = "Garder l'écran allumé (sinon Claude ne peut plus agir)"
+            isChecked = prefs.getBoolean("keep_screen", true)
+        }
+        box.addView(screenCheck)
+        val newTokenCheck = CheckBox(this).apply { text = "Générer un nouveau jeton secret (déconnecte Claude, il faudra recopier l'adresse)" }
+        box.addView(newTokenCheck)
 
         AlertDialog.Builder(this)
             .setTitle("Réglages")
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("Enregistrer") { _, _ ->
                 val desktopChanged = desktopCheck.isChecked != prefs.getBoolean("desktop", true)
-                prefs.edit()
-                    .putString("api_key", keyEdit.text.toString().trim())
-                    .putString("model", MODELS[modelSpin.selectedItemPosition].first)
-                    .putString("effort", efforts[effortSpin.selectedItemPosition].first)
+                val port = portEdit.text.toString().toIntOrNull()?.coerceIn(1024, 65535) ?: 8765
+                val restart = port != prefs.getInt("port", 8765) || newTokenCheck.isChecked
+                val e = prefs.edit()
+                    .putString("device_name", nameEdit.text.toString().trim())
+                    .putInt("port", port)
                     .putBoolean("desktop", desktopCheck.isChecked)
-                    .apply()
+                    .putBoolean("keep_screen", screenCheck.isChecked)
+                if (newTokenCheck.isChecked) e.putString("token", newToken())
+                e.apply()
+                if (screenCheck.isChecked) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 if (desktopChanged) { applyUserAgent(); web.reload() }
+                server.token = token()
+                if (restart) startServer() else refreshAddress()
             }
             .setNegativeButton("Annuler", null)
             .show()
@@ -463,8 +548,18 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
     override suspend fun goBack(): Boolean = withContext(Dispatchers.Main) { if (web.canGoBack()) { web.goBack(); true } else false }
     override suspend fun goForward(): Boolean = withContext(Dispatchers.Main) { if (web.canGoForward()) { web.goForward(); true } else false }
     override suspend fun reload() = withContext(Dispatchers.Main) { web.reload() }
+    override suspend fun showMessage(text: String) = withContext(Dispatchers.Main) {
+        log(LogKind.CLAUDE, text)
+        if (body.visibility != View.VISIBLE) togglePanel()
+        Toast.makeText(this@MainActivity, text, Toast.LENGTH_LONG).show()
+    }
 
     // ----------------------------------------------------------------- cycle de vie
+
+    override fun onResume() {
+        super.onResume()
+        if (::server.isInitialized) refreshAddress()
+    }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && web.canGoBack()) { web.goBack(); return true }
@@ -482,6 +577,7 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
     }
 
     override fun onDestroy() {
+        server.stop()
         scope.cancel()
         web.destroy()
         super.onDestroy()
@@ -493,10 +589,5 @@ class MainActivity : Activity(), ClaudeAgent.Listener, BrowserTools.Ui {
         private const val REQ_FILE = 42
         private const val DESKTOP_UA =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        val MODELS = listOf(
-            "claude-opus-5-5" to "Claude Opus 5.5 (le plus fiable)",
-            "claude-sonnet-5-5" to "Claude Sonnet 5.5 (moins cher)",
-            "claude-haiku-5-5" to "Claude Haiku 5.5 (très économique)",
-        )
     }
 }

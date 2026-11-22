@@ -1,9 +1,5 @@
 package com.julienots.playbridge
 
-import com.anthropic.core.JsonValue
-import com.anthropic.models.beta.messages.BetaBase64ImageSource
-import com.anthropic.models.beta.messages.BetaTool
-import com.anthropic.models.beta.messages.BetaToolResultBlockParam
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -12,38 +8,33 @@ import org.json.JSONObject
 
 /** Résultat d'un outil : texte, et éventuellement une capture JPEG en base64. */
 data class ToolOutput(val text: String, val imageB64: String? = null, val isError: Boolean = false) {
-    fun toBlocks(): List<BetaToolResultBlockParam.Content.Block> {
-        val blocks = mutableListOf(BetaToolResultBlockParam.Content.Block.ofText(text))
-        if (imageB64 != null) {
-            blocks += BetaToolResultBlockParam.Content.Block.ofImage(
-                BetaBase64ImageSource.builder()
-                    .mediaType(BetaBase64ImageSource.MediaType.IMAGE_JPEG)
-                    .data(imageB64)
-                    .build()
-            )
-        }
-        return blocks
+    /** Contenu MCP : [{type:text}, {type:image}] */
+    fun toMcpContent(): JSONArray {
+        val arr = JSONArray().put(JSONObject().put("type", "text").put("text", text))
+        if (imageB64 != null) arr.put(JSONObject().put("type", "image").put("data", imageB64).put("mimeType", "image/jpeg"))
+        return arr
     }
 }
 
 class BrowserTools(
     private val web: WebController,
     private val ui: Ui,
-) {
+) : ToolHost {
     /** Actions de l'interface que les outils peuvent demander. */
     interface Ui {
         suspend fun loadUrl(url: String)
         suspend fun goBack(): Boolean
         suspend fun goForward(): Boolean
         suspend fun reload()
+        suspend fun showMessage(text: String)
         val homeUrl: String
     }
 
-    val definitions: List<BetaTool> get() = DEFINITIONS
+    override val definitions: List<JSONObject> get() = DEFINITIONS
 
     // ------------------------------------------------------------ exécution
 
-    suspend fun run(name: String, input: Map<String, Any?>): ToolOutput = try {
+    override suspend fun run(name: String, input: Map<String, Any?>): ToolOutput = try {
         when (name) {
             "screenshot" -> screenshot(input.int("quality") ?: 60)
             "read_page" -> readPage(input.bool("all") ?: false, input.int("max_text") ?: 2500)
@@ -55,6 +46,7 @@ class BrowserTools(
             "navigate" -> navigate(input)
             "wait" -> waitFor(input)
             "run_js" -> runJs(input.str("code") ?: "")
+            "message" -> { ui.showMessage(input.str("text") ?: ""); ToolOutput("Message affiché à l'utilisateur.") }
             "status" -> status()
             else -> ToolOutput("Outil inconnu : $name", isError = true)
         }
@@ -301,7 +293,7 @@ class BrowserTools(
     companion object {
         // ------------------------------------------------------------ définitions
 
-        val DEFINITIONS: List<BetaTool> = listOf(
+        val DEFINITIONS: List<JSONObject> = listOf(
             tool(
                 "screenshot",
                 "Capture de ce qu'affiche l'application (image JPEG). Les coordonnées de l'image sont celles à utiliser pour click/scroll avec x et y.",
@@ -357,7 +349,7 @@ class BrowserTools(
                 "scroll",
                 "Fait défiler par un glissement du doigt : direction up|down|left|right (sens du contenu), amount en pixels de capture (défaut 500). Glisse au centre de l'écran, ou à x/y, ou sur l'élément index.",
                 mapOf(
-                    "direction" to JsonValue.from(mapOf("type" to "string", "enum" to listOf("up", "down", "left", "right"))),
+                    "direction" to JSONObject(mapOf("type" to "string", "enum" to listOf("up", "down", "left", "right"))),
                     "amount" to prop("number", "Distance en pixels de capture"),
                     "x" to prop("number", "Abscisse de départ (capture)"),
                     "y" to prop("number", "Ordonnée de départ (capture)"),
@@ -370,7 +362,7 @@ class BrowserTools(
                 "Ouvre une adresse (url), ou action : back, forward, reload, home (Google Play Console).",
                 mapOf(
                     "url" to prop("string", "Adresse à ouvrir"),
-                    "action" to JsonValue.from(mapOf("type" to "string", "enum" to listOf("back", "forward", "reload", "home"))),
+                    "action" to JSONObject(mapOf("type" to "string", "enum" to listOf("back", "forward", "reload", "home"))),
                 ),
             ),
             tool(
@@ -389,23 +381,28 @@ class BrowserTools(
                 required = listOf("code"),
             ),
             tool(
+                "message",
+                "Affiche un message bien visible à l'utilisateur sur l'écran de l'appareil (par exemple : « Choisis le fichier AAB dans le sélecteur », « Connecte-toi puis dis-le-moi »).",
+                mapOf("text" to prop("string", "Message à afficher")),
+                required = listOf("text"),
+            ),
+            tool(
                 "status",
                 "État de l'application : page affichée (URL, titre), chargement, taille de la capture, sélecteur de fichiers ouvert ou non.",
                 emptyMap(),
             ),
         )
 
-        private fun prop(type: String, description: String): JsonValue =
-            JsonValue.from(mapOf("type" to type, "description" to description))
+        private fun prop(type: String, description: String): JSONObject =
+            JSONObject().put("type", type).put("description", description)
 
-        private fun tool(name: String, description: String, props: Map<String, JsonValue>, required: List<String> = emptyList()): BetaTool {
-            val properties = BetaTool.InputSchema.Properties.builder()
-            props.forEach { (k, v) -> properties.putAdditionalProperty(k, v) }
-            val schema = BetaTool.InputSchema.builder().properties(properties.build())
-            if (required.isNotEmpty()) schema.required(required)
-            return BetaTool.builder().name(name).description(description).inputSchema(schema.build()).build()
+        private fun tool(name: String, description: String, props: Map<String, JSONObject>, required: List<String> = emptyList()): JSONObject {
+            val properties = JSONObject()
+            props.forEach { (k, v) -> properties.put(k, v) }
+            val schema = JSONObject().put("type", "object").put("properties", properties)
+            if (required.isNotEmpty()) schema.put("required", JSONArray(required))
+            return JSONObject().put("name", name).put("description", description).put("inputSchema", schema)
         }
-
     }
 }
 
